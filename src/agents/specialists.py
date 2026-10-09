@@ -8,9 +8,10 @@ Each specialist is a Pydantic-AI agent with:
   - access to the shared `AgentDeps` (session state) so values chain between agents.
 
 Specialists are deliberately narrow. Reasoning about *which* specialist to use,
-in *what order*, is the supervisor's job (see supervisor.py). This mirrors
-Treasure AI's agent-hub model (Attribution Agent, Target-List Refinement Agent,
-etc. operating on the same unified data foundation).
+in *what order*, is the supervisor's job (see supervisor.py). This is the
+classic supervisor/worker pattern used by enterprise agent hubs: each specialist
+owns one domain (audience, analytics, attribution, lookalikes, campaign
+planning, governance) and operates on the same unified data foundation.
 
 Important Pydantic-AI constraint: because the supervisor *delegates* by calling
 `await specialist.run(...)` inside an async tool, these agents must never be run

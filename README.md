@@ -1,6 +1,6 @@
 # Agentic Customer Data Platform (CDP) for Marketing Intelligence, Audience Activation, and Campaign Optimization
 
-A production-style **reference implementation** of an **Agentic Customer Intelligence & Activation Platform** inspired by enterprise CDPs such as **Treasure AI** (formerly Treasure Data) and its Agentic Experience Platform.
+A production-style **reference implementation** of an **Agentic Customer Intelligence & Activation Platform** — an end-to-end CDP-inspired system built from scratch: data unification, marketing analytics, LLM agents, and governed campaign activation.
 
 The platform unifies fragmented customer data into golden 360 profiles, runs marketing ML analytics (RFM, predictive CLTV, lead propensity, multi-touch attribution, lookalikes), and exposes them through a **governed conversational copilot with real LLM tool calling and human-in-the-loop campaign activation**.
 
@@ -148,15 +148,15 @@ PYTHONPATH=. uv run streamlit run src/app/streamlit_app.py
 
 ---
 
-## 🎯 Alignment with Treasure AI / Treasure Data
+## 🎯 Capability Map
 
-| Treasure AI ships | This project |
+| Enterprise CDP capability | This project |
 |---|---|
-| Intelligent CDP + identity resolution | ✅ DuckDB profiles + graph identity resolution |
-| Multi-Touch Attribution Agent | ✅ 5 attribution models, reconciliation |
-| Target List Refinement (churn/consent suppression) | ✅ consent fail-closed + suppression |
-| Treasure AI Studio (conversational) | ✅ Streamlit copilot + multi-agent supervisor |
-| Agent hub (specialist agents) | ✅ 6 specialists: audience, analytics, attribution, lookalike, planner, governance |
+| Unified customer profiles + identity resolution | ✅ DuckDB profiles + graph identity resolution |
+| Multi-touch attribution | ✅ 5 attribution models, reconciliation |
+| Churn-risk / consent suppression | ✅ consent fail-closed + suppression |
+| Conversational copilot | ✅ Streamlit chat + multi-agent supervisor |
+| Specialist agent hub | ✅ 6 specialists: audience, analytics, attribution, lookalike, planner, governance |
 | Human-in-the-loop activation | ✅ signed, scoped, single-use approval tokens |
 | Agent auditability | ✅ full audit log |
 | Incrementality / experimentation | ✅ holdout-based lift measurement |

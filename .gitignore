@@ -46,3 +46,6 @@ models/
 .idea/
 .vscode/
 *.swp
+
+# Personal planning notes (kept local, not published)
+idea.text
