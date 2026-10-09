@@ -71,11 +71,20 @@ flowchart TD
 
 **Why the lead-scoring label matters:** an earlier version predicted “has this customer *ever* purchased” — a ~97% positive constant that produced a meaningless PR-AUC of 0.986. The label is now a truly forward-looking *purchase within the next 30 days* (14% base rate), so the metrics are honest and interpretable.
 
-### 3. Agentic Copilot (real tool calling)
-- **Pydantic-AI agent** with Groq LLM: the model chooses tools, with typed arg schemas, and can chain calls (e.g. build audience → prepare campaign plan using the returned `audience_id`).
-- 8 governed tools: profile lookup, RFM overview, audience filter, lookalikes, MTA, campaign plan, activation, incrementality.
+### 3. Agentic Copilot (multi-agent, real tool calling)
+- **Supervisor / specialist orchestration with Pydantic-AI**: a supervisor agent decides which specialist to delegate to, and in what order, via typed async tools.
+- **Six specialists**, each owning a subset of the CDP tools and returning a typed result:
+  - **Audience Analyst** — builds consent-compliant audiences (`create_audience_filter`)
+  - **Customer Analytics** — RFM overviews, 360 profiles
+  - **Attribution Analyst** — MTA comparison (first/last/linear/decay/Markov)
+  - **Lookalike** — seed-segment expansion into ranked prospects
+  - **Campaign Planner** — drafts campaigns and issues signed approval tokens (never activates)
+  - **Governance & Approval** — reviews activation requests against policy
+- **Shared session state** (`SessionState` in `AgentDeps`): a value produced by one agent (e.g. `audience_id`) is visible to the next, enabling multi-step chains like *build audience → plan campaign for that audience → measure*.
+- **Governed activation endpoint**: the supervisor's only direct tool, requiring a valid signed human token — the model cannot synthesise one.
 - **Structured output** (`AgentAnswer`) with summary, key metrics, next action, governance notes.
-- **Deterministic fallback** when no API key is set, so the platform stays demonstrable offline.
+- **Deterministic fallback** (`DeterministicRouter`) when no API key is set; it also threads session state so offline demos stay chained.
+- **Thread-safe warehouse**: DuckDB connections are per-thread, because agent tools execute inside worker threads.
 
 ### 4. Governance & Human-in-the-Loop
 - **Signed approval tokens**: HMAC-SHA256, expiring, bound to campaign/audience/channel scope, registered and **single-use** (replay rejected). A bare `MKT_APPRV_` prefix is no longer accepted.
@@ -109,7 +118,7 @@ cp .env.example .env   # then set CDP_APPROVAL_SECRET and optionally GROQ_API_KE
 PYTHONPATH=. uv run python src/cdp/pipeline.py
 ```
 
-### Run the test suite (18 tests)
+### Run the test suite (25 tests)
 ```bash
 PYTHONPATH=. uv run pytest tests/ -v
 ```
@@ -146,7 +155,8 @@ PYTHONPATH=. uv run streamlit run src/app/streamlit_app.py
 | Intelligent CDP + identity resolution | ✅ DuckDB profiles + graph identity resolution |
 | Multi-Touch Attribution Agent | ✅ 5 attribution models, reconciliation |
 | Target List Refinement (churn/consent suppression) | ✅ consent fail-closed + suppression |
-| Treasure AI Studio (conversational) | ✅ Streamlit copilot + Pydantic-AI agent |
+| Treasure AI Studio (conversational) | ✅ Streamlit copilot + multi-agent supervisor |
+| Agent hub (specialist agents) | ✅ 6 specialists: audience, analytics, attribution, lookalike, planner, governance |
 | Human-in-the-loop activation | ✅ signed, scoped, single-use approval tokens |
 | Agent auditability | ✅ full audit log |
 | Incrementality / experimentation | ✅ holdout-based lift measurement |
@@ -160,9 +170,9 @@ PYTHONPATH=. uv run streamlit run src/app/streamlit_app.py
 ```
 src/
   ingestion/     synthetic data generator (entities, identities, events, touchpoints)
-  cdp/           DuckDB warehouse, identity resolution graph, ETL pipeline
+  cdp/           DuckDB warehouse (thread-safe), identity resolution graph, ETL pipeline
   analytics/     RFM, CLTV, lead scoring, MTA, lookalikes
-  agents/        Pydantic-AI supervisor + tools + governance (PII, consent, tokens)
+  agents/        supervisor + specialists (6), session state, governance (PII, consent, tokens)
   app/           Streamlit copilot & dashboard
-tests/           18 agent-evaluation, security & integrity tests
+tests/           25 agent-orchestration, security & integrity tests
 ```

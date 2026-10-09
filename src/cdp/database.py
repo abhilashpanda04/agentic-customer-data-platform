@@ -12,6 +12,7 @@ Initializes schemas and persists:
 - agent_audit_log (Tracks every agent invocation, tool call, governance check & human approvals)
 """
 import os
+import threading
 import duckdb
 import pandas as pd
 from datetime import datetime
@@ -22,8 +23,25 @@ class CDPDatabase:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        self.conn = duckdb.connect(self.db_path)
-        self._init_schemas()
+        # DuckDB connections are bound to the creating thread. Agent tools can
+        # run inside worker threads, so each thread gets its own connection to
+        # the same file (schemas are idempotent CREATE TABLE IF NOT EXISTS).
+        self._local = threading.local()
+        self._init_db()
+
+    @property
+    def conn(self):
+        """Thread-local DuckDB connection; lazily opened per thread."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = duckdb.connect(self.db_path)
+            self._local.conn = conn
+            self._init_schemas()
+        return conn
+
+    def _init_db(self):
+        """Opens the main-thread connection and creates schemas eagerly."""
+        _ = self.conn  # triggers property -> connection + schemas
 
     def _init_schemas(self):
         """Create standard enterprise CDP relational tables."""
@@ -376,7 +394,14 @@ class CDPDatabase:
         return True, "Token consumed."
 
     def close(self):
-        self.conn.close()
+        """Closes the current thread's connection (safe no-op elsewhere)."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._local.conn = None
 
 if __name__ == "__main__":
     from src.ingestion.synthetic_generator import generate_cdp_dataset

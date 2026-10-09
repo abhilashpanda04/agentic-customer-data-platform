@@ -1,117 +1,42 @@
 """
-MarTech Supervisor Agent - real LLM tool calling via Pydantic-AI.
+MarTech Supervisor Agent - multi-agent orchestration with Pydantic-AI.
 
 Architecture
 ------------
-This is a genuine agentic loop, not an if/elif router:
+A genuine supervisor/worker pattern:
 
     user prompt
-      -> Pydantic-AI agent (Groq llm)
-      -> model *chooses* which CDP tools to call, with typed arguments
-      -> tools execute against DuckDB, each writing to the audit log
-      -> model may call more tools (multi-step) before producing a typed answer
+      -> Supervisor agent (Groq LLM)
+      -> decides which specialist(s) to delegate to, and in what order
+      -> specialists run their own tools against DuckDB; each writes audit rows
+      -> results flow through shared AgentDeps/SessionState, so a value built by
+         one specialist (audience_id) is available to the next (campaign planner)
+      -> supervisor composes a single typed AgentAnswer
 
-Every tool is a plain Python function with type hints and a docstring; Pydantic-AI
-derives the JSON schema the model sees, and validates the model's arguments before
-execution. Tool arguments are Pydantic-validated, so a hallucinated segment name or
-a malformed date fails safely instead of reaching SQL.
+Specialists (see specialists.py): audience analyst, customer analytics,
+attribution analyst, lookalike, campaign planner, governance & approval.
 
-Governance is enforced *below* the model: the tools themselves apply consent
-filtering, PII masking, and token verification. The model cannot bypass them by
-choosing different arguments.
+The supervisor NEVER activates a campaign autonomously: activation requires a
+signed human approval token present in the user's request. Governance lives in
+the tools (consent filtering, PII masking, token verification), so no chain of
+agent calls can bypass it.
 
-If no GROQ_API_KEY is configured, `DeterministicRouter` provides an equivalent
-tool-calling path so the platform remains demonstrable and testable offline.
+If no GROQ_API_KEY is configured, DeterministicRouter provides a stateful
+keyword-driven path so the platform stays demonstrable and testable offline.
 """
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+import re
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
+from pydantic_ai import RunContext  # noqa: F401 - used in tool annotations (module scope)
 
 from src.agents.governance import GovernanceGuardrails
+from src.agents.state import AgentDeps, SessionState
 from src.agents.tools.cdp_tools import CDPTools
 from src.cdp.database import CDPDatabase
-
-# --------------------------------------------------------------------------
-# Typed tool argument models (these are what the LLM must produce)
-# --------------------------------------------------------------------------
-
-
-class EmptyArgs(BaseModel):
-    """No arguments required."""
-
-
-class CustomerProfileArgs(BaseModel):
-    ucid: str = Field(description="Unified Customer ID, e.g. 'UCID_00042'.")
-
-
-class AudienceFilterArgs(BaseModel):
-    rfm_segment: Optional[str] = Field(
-        default=None,
-        description=(
-            "RFM segment to filter on. One of: Champions, Loyal Customers, "
-            "Potential Loyalists, New / Promising Customers, Needs Attention, "
-            "About to Sleep, At-Risk High Value, Hibernating, "
-            "Prospect (Zero Purchases)."
-        ),
-    )
-    min_cltv: Optional[float] = Field(default=None, description="Minimum predicted CLTV in USD.")
-    min_frequency: Optional[int] = Field(default=None, description="Minimum number of historical orders.")
-    min_recency_days: Optional[int] = Field(default=None, description="Minimum days since last purchase.")
-    max_recency_days: Optional[int] = Field(default=None, description="Maximum days since last purchase.")
-    min_churn_risk: Optional[float] = Field(
-        default=None, description="Minimum churn risk score between 0.0 and 1.0."
-    )
-
-
-class LookalikeArgs(BaseModel):
-    seed_rfm_segment: str = Field(
-        default="Champions", description="RFM segment to use as the high-value seed."
-    )
-    top_k: int = Field(default=50, ge=1, le=1000, description="How many lookalikes to return.")
-
-
-class MTAArgs(BaseModel):
-    start_date: Optional[str] = Field(
-        default=None, description="ISO start date (YYYY-MM-DD). Optional."
-    )
-    end_date: Optional[str] = Field(
-        default=None, description="ISO end date (YYYY-MM-DD). Optional."
-    )
-
-
-class CampaignPlanArgs(BaseModel):
-    campaign_name: str = Field(description="Human-readable campaign name.")
-    audience_id: str = Field(description="Audience ID returned by create_audience_filter.")
-    channel: str = Field(description="Activation channel, e.g. 'email_marketing', 'paid_social'.")
-    message_objective: str = Field(description="What the campaign should achieve.")
-    offer_discount: str = Field(default="No discount", description="Incentive offered.")
-    frequency_cap: int = Field(default=2, ge=1, le=10, description="Max touches per week.")
-
-
-class ActivationArgs(BaseModel):
-    campaign_name: str = Field(description="Campaign name the token was issued for.")
-    audience_id: str = Field(description="Audience ID the token was issued for.")
-    channel: str = Field(description="Channel the token was issued for.")
-    approval_token: str = Field(
-        description="Signed human approval token beginning 'MKT_APPRV_'. Required."
-    )
-    audience_size: int = Field(default=0, ge=0, description="Number of customers targeted.")
-
-
-class IncrementalityArgs(BaseModel):
-    activation_id: str = Field(description="Activation ID from activate_campaign.")
-    holdout_fraction: float = Field(
-        default=0.1, ge=0.01, le=0.5, description="Share of audience held out as control."
-    )
-
-
-# --------------------------------------------------------------------------
-# Typed final answer
-# --------------------------------------------------------------------------
 
 
 class AgentAnswer(BaseModel):
@@ -130,59 +55,55 @@ class AgentAnswer(BaseModel):
     )
 
 
-@dataclass
-class AgentDeps:
-    """Dependencies injected into the agent run."""
+SUPERVISOR_SYSTEM_PROMPT = """You are the MarTech Intelligence Copilot for an enterprise Customer Data Platform (CDP).
 
-    tools: CDPTools
-    session_id: str = "default"
-    tool_calls: List[str] = field(default_factory=list)
-    governance_events: List[str] = field(default_factory=list)
+You are a SUPERVISOR. You do not perform analytics yourself — you delegate to
+specialist agents and compose their results into one answer.
 
+Specialists you can delegate to (use the matching tool):
+- Audience Analyst: to build a consent-compliant target audience from criteria.
+- Customer Analytics: RFM segment overviews or single-customer 360 profiles.
+- Attribution Analyst: multi-touch attribution comparison across channels.
+- Lookalike: to expand a high-value seed segment into prospects.
+- Campaign Planner: to draft a campaign and issue a signed approval token.
+- Governance & Approval: to review an activation request against policy.
 
-# --------------------------------------------------------------------------
-# System prompt
-# --------------------------------------------------------------------------
+How to work:
+- Choose the specialist(s) the user's request needs. Several requests need
+  multiple specialists — delegate in the right order and chain their outputs
+  (e.g. build an audience, then plan a campaign for that audience_id).
+- Each delegation tool takes a `task` string: restate what the user needs in
+  concrete marketing terms (segment, channel, criteria, objective).
+- Base every number in your final answer strictly on what specialists returned.
+  If a specialist reports an error or empty result, say so plainly.
 
-SYSTEM_PROMPT = """You are the MarTech Intelligence Copilot for an enterprise Customer Data Platform (CDP).
+Hard governance rules (non-negotiable):
+- You may PLAN campaigns, but you may NEVER activate one yourself. Activation
+  requires a signed approval token beginning with 'MKT_APPRV_' that a human
+  marketer supplied in the conversation. If the user asks to launch/activate
+  without such a token, delegate to the Campaign Planner instead and explain
+  that human approval is required.
+- If the user DOES supply a token (you can see it in the conversation), you may
+  call the activation endpoint with it — but only after governance review.
+- Never reveal raw emails/phones/PII; tools return masked identifiers.
+- Audiences are consent-filtered automatically; report suppressed counts.
 
-You help marketing managers answer questions about unified customer profiles, segments,
-lifetime value, attribution, and campaign activation.
-
-How you work:
-- You have tools. Decide for yourself which tools to call and in what order.
-- Chain tools when needed. For example: create an audience, then prepare a campaign plan
-  for that audience, using the audience_id the first tool returned.
-- Base every number in your answer strictly on tool output. Never invent metrics.
-- If a tool returns an error or an empty result, say so plainly instead of guessing.
-
-Hard governance rules you must respect:
-- You can PREPARE campaigns but you can NEVER activate one yourself. Activation requires
-  a signed approval token that only a human marketer can supply. If asked to activate
-  without a token, explain that human approval is required and call prepare_campaign_plan.
-- Never attempt to reveal raw email addresses, phone numbers, or other direct PII.
-  Tools return masked identifiers; do not try to work around that.
-- Audiences are consent-filtered automatically. Report suppressed counts when relevant.
-
-Be concise, use concrete numbers, and always state a recommended next action.
+Be concise, use concrete numbers, and always recommend a next action.
 """
 
 
-# --------------------------------------------------------------------------
-# Agent construction
-# --------------------------------------------------------------------------
-
-
 class MarTechSupervisorAgent:
-    """Supervisor agent that performs real LLM tool calling."""
+    """Supervisor agent that delegates to specialist agents."""
 
     def __init__(self, db: Optional[CDPDatabase] = None, session_id: str = "default"):
         self.db = db or CDPDatabase()
         self.session_id = session_id
+        self.state = SessionState(session_id=session_id)
         self.tools = CDPTools(self.db, session_id=session_id)
         self.api_key = os.getenv("GROQ_API_KEY", "").strip()
         self.model_name = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
         self._agent = None
+        self.specialists: Dict[str, Any] = {}
         if self.api_key:
             self._agent = self._build_agent()
 
@@ -190,88 +111,134 @@ class MarTechSupervisorAgent:
     def llm_available(self) -> bool:
         return self._agent is not None
 
+    # ---------------------------------------------------------- construction --
     def _build_agent(self):
-        """Constructs the Pydantic-AI agent with all CDP tools registered."""
-        from pydantic_ai import Agent
+        """Builds the supervisor agent and the specialist agents it delegates to."""
+        from pydantic_ai import Agent, RunContext
         from pydantic_ai.models.groq import GroqModel
         from pydantic_ai.providers.groq import GroqProvider
+
+        from src.agents.specialists import build_specialists
 
         model = GroqModel(
             self.model_name,
             provider=GroqProvider(api_key=self.api_key),
         )
-        agent = Agent(
+        # Specialists share the same model; each owns a subset of tools.
+        self.specialists = build_specialists(model)
+
+        supervisor = Agent(
             model,
             output_type=AgentAnswer,
             deps_type=AgentDeps,
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=SUPERVISOR_SYSTEM_PROMPT,
             retries=2,
         )
 
-        # ---- analytics tools ----
-        @agent.tool_plain
-        def get_rfm_segments_overview() -> Dict[str, Any]:
-            """Get the distribution of customers across RFM segments, with average
-            recency, order count, monetary value and predicted CLTV per segment.
-            Use this for open-ended questions about the customer base."""
-            return self.tools.get_rfm_segments_overview()
+        # ---- delegation tools: one per specialist ----
+        @supervisor.tool
+        async def delegate_to_audience_analyst(
+            ctx: RunContext[AgentDeps], task: str
+        ) -> Dict[str, Any]:
+            """Delegate audience-building to the Audience Analyst specialist.
+            Use for requests like 'build a win-back audience of at-risk high-value
+            customers' or 'find people who haven't purchased in 90 days'."""
+            result = await self.specialists["audience"].run(task, deps=ctx.deps)
+            return result.output.model_dump()
 
-        @agent.tool_plain
-        def create_audience_filter(args: AudienceFilterArgs) -> Dict[str, Any]:
-            """Build a consent-compliant target audience from behavioral criteria.
-            Returns an audience_id you can pass to prepare_campaign_plan."""
-            return self.tools.create_audience_filter(**args.model_dump())
+        @supervisor.tool
+        async def delegate_to_customer_analytics(
+            ctx: RunContext[AgentDeps], task: str
+        ) -> Dict[str, Any]:
+            """Delegate to the Customer Analytics specialist for RFM segment
+            overviews, segment sizes/averages, or single-customer profiles."""
+            result = await self.specialists["analytics"].run(task, deps=ctx.deps)
+            return result.output.model_dump()
 
-        @agent.tool_plain
-        def generate_lookalike_audience(args: LookalikeArgs) -> Dict[str, Any]:
-            """Expand a high-value seed segment into a lookalike prospect audience."""
-            return self.tools.generate_lookalike_audience(**args.model_dump())
+        @supervisor.tool
+        async def delegate_to_attribution_analyst(
+            ctx: RunContext[AgentDeps], task: str
+        ) -> Dict[str, Any]:
+            """Delegate to the Attribution Analyst specialist to compare first/last/
+            linear/time-decay/Markov attribution across channels."""
+            result = await self.specialists["attribution"].run(task, deps=ctx.deps)
+            return result.output.model_dump()
 
-        @agent.tool_plain
-        def run_mta_attribution_comparison(args: MTAArgs) -> Dict[str, Any]:
-            """Compare first-touch, last-touch, linear, time-decay and Markov
-            multi-touch attribution by channel."""
-            return self.tools.run_mta_attribution_comparison(**args.model_dump())
+        @supervisor.tool
+        async def delegate_to_lookalike_agent(
+            ctx: RunContext[AgentDeps], task: str
+        ) -> Dict[str, Any]:
+            """Delegate to the Lookalike specialist to expand a high-value seed
+            segment into ranked prospects."""
+            result = await self.specialists["lookalike"].run(task, deps=ctx.deps)
+            return result.output.model_dump()
 
-        @agent.tool_plain
-        def query_customer_profile(args: CustomerProfileArgs) -> Dict[str, Any]:
-            """Look up a single unified customer profile by UCID (PII masked)."""
-            return self.tools.query_customer_profile(**args.model_dump())
+        @supervisor.tool
+        async def delegate_to_campaign_planner(
+            ctx: RunContext[AgentDeps], task: str
+        ) -> Dict[str, Any]:
+            """Delegate to the Campaign Planner specialist to draft a campaign and
+            issue a signed human-approval token. Never activates anything."""
+            result = await self.specialists["planner"].run(task, deps=ctx.deps)
+            return result.output.model_dump()
 
-        # ---- activation tools (governed) ----
-        @agent.tool_plain
-        def prepare_campaign_plan(args: CampaignPlanArgs) -> Dict[str, Any]:
-            """Draft a campaign and issue a signed human-approval token. This does
-            NOT activate anything. Use this whenever the user asks to launch or
-            activate a campaign."""
-            return self.tools.prepare_campaign_plan(**args.model_dump())
+        @supervisor.tool
+        async def delegate_to_governance_review(
+            ctx: RunContext[AgentDeps], task: str
+        ) -> Dict[str, Any]:
+            """Delegate to the Governance & Approval specialist to review an
+            activation request (token validity, expiry, scope, audience) and
+            return a policy decision."""
+            result = await self.specialists["governance"].run(task, deps=ctx.deps)
+            return result.output.model_dump()
 
-        @agent.tool_plain
-        def activate_campaign(args: ActivationArgs) -> Dict[str, Any]:
-            """Activate a campaign. REQUIRES a valid signed approval token that the
-            human supplied. Fails if the token is missing, forged, expired, reused,
-            or scoped to a different campaign."""
-            return self.tools.activate_campaign(**args.model_dump())
+        # ---- the one governed endpoint the supervisor may call ----
+        @supervisor.tool
+        def activate_campaign_with_token(
+            ctx: RunContext[AgentDeps], approval_token: str
+        ) -> Dict[str, Any]:
+            """Activate a campaign using a signed human approval token that the
+            marketer supplied in the conversation. The token's embedded scope
+            (campaign, audience, channel) determines what is activated. Fails if
+            the token is missing, forged, expired, reused, or scope-mismatched."""
+            verification = GovernanceGuardrails.verify_activation_approval(approval_token)
+            if not verification.valid:
+                return {
+                    "status": "REJECTED",
+                    "error": verification.reason,
+                    "governance_status": "BLOCKED_BY_GOVERNANCE",
+                }
+            payload = verification.payload or {}
+            out = self.tools.activate_campaign(
+                campaign_name=payload.get("campaign_name", "Campaign"),
+                audience_id=payload.get("audience_id", "AUD_UNKNOWN"),
+                channel=payload.get("channel", "email_marketing"),
+                approval_token=approval_token,
+                audience_size=120,
+            )
+            if out.get("status") == "SUCCESS":
+                self.state.activated_campaigns.append(out.get("activation_id", ""))
+            return out
 
-        @agent.tool_plain
-        def measure_campaign_incrementality(args: IncrementalityArgs) -> Dict[str, Any]:
-            """Measure holdout-based incremental lift for a completed activation."""
-            return self.tools.measure_campaign_incrementality(**args.model_dump())
+        return supervisor
 
-        return agent
-
-    # --------------------------------------------------------------- run ---
+    # ------------------------------------------------------------------ run --
     def process_query(self, user_prompt: str) -> Dict[str, Any]:
         """
-        Runs the agent on a user prompt and returns a structured response.
+        Runs the agentic pipeline on a user prompt.
 
-        Falls back to the deterministic router when no LLM is configured.
+        LLM path: supervisor delegates to specialists (stateful, multi-step).
+        Fallback: DeterministicRouter when no LLM is configured.
         """
         cleaned = GovernanceGuardrails.mask_pii((user_prompt or "").strip())
-        deps = AgentDeps(tools=self.tools, session_id=self.session_id)
+        deps = AgentDeps(
+            tools=self.tools,
+            state=self.state,
+            session_id=self.session_id,
+        )
 
         if not self.llm_available:
-            return DeterministicRouter(self.tools, self.session_id).process_query(cleaned)
+            return DeterministicRouter(self.tools, self.session_id, self.state).process_query(cleaned)
 
         # Pre-flight: refuse explicit PII extraction attempts before any model call.
         lowered = cleaned.lower()
@@ -294,7 +261,7 @@ class MarTechSupervisorAgent:
                 "governance_status": "BLOCKED_BY_POLICY",
                 "tool_output": None,
                 "recommended_next_action": "Ask for a masked profile summary instead.",
-                "agent_mode": "llm_tool_calling",
+                "agent_mode": "llm_multi_agent",
             }
 
         try:
@@ -304,13 +271,13 @@ class MarTechSupervisorAgent:
             self.db.write_audit_log(
                 session_id=self.session_id,
                 action_type="agent_response",
-                tool_name="pydantic_ai_agent",
+                tool_name="supervisor_agent",
                 request_prompt=cleaned,
                 governance_status="PASSED",
                 details={
                     "model": self.model_name,
+                    "delegations": self.state.governance_events[-10:],
                     "summary": answer.summary[:500],
-                    "key_metrics": answer.key_metrics,
                 },
             )
 
@@ -323,19 +290,19 @@ class MarTechSupervisorAgent:
                 "governance_notes": answer.governance_notes,
                 "governance_status": "PASSED",
                 "tool_output": None,
-                "agent_mode": "llm_tool_calling",
+                "agent_mode": "llm_multi_agent",
             }
 
-        except Exception as exc:  # noqa: BLE001 - surface any failure as a fallback
+        except Exception as exc:  # noqa: BLE001 - degrade gracefully
             self.db.write_audit_log(
                 session_id=self.session_id,
                 action_type="agent_error",
-                tool_name="pydantic_ai_agent",
+                tool_name="supervisor_agent",
                 request_prompt=cleaned,
                 governance_status="DEGRADED",
                 details={"error": str(exc)[:500]},
             )
-            fallback = DeterministicRouter(self.tools, self.session_id).process_query(cleaned)
+            fallback = DeterministicRouter(self.tools, self.session_id, self.state).process_query(cleaned)
             fallback["agent_mode"] = "deterministic_fallback"
             fallback["llm_error"] = str(exc)[:300]
             return fallback
@@ -352,10 +319,10 @@ class DeterministicRouter:
 
     Kept deliberately simple: it exists so the platform is demonstrable and
     testable offline, not to emulate agentic reasoning. It still enforces the
-    same governance preflight (PII) and honouring a token's own scope.
+    same governance preflight and honours a token's own scope, and it keeps the
+    session state current so stateful chaining works offline too.
     """
 
-    #: Phrases that indicate an attempt to extract raw PII.
     PII_VIOLATION_PHRASES = (
         "raw email",
         "export pii",
@@ -366,9 +333,15 @@ class DeterministicRouter:
         "extract phone",
     )
 
-    def __init__(self, tools: CDPTools, session_id: str = "default"):
+    def __init__(
+        self,
+        tools: CDPTools,
+        session_id: str = "default",
+        state: Optional[SessionState] = None,
+    ):
         self.tools = tools
         self.session_id = session_id
+        self.state = state or SessionState(session_id=session_id)
 
     def process_query(self, user_prompt: str) -> Dict[str, Any]:
         cleaned = GovernanceGuardrails.mask_pii((user_prompt or "").strip())
@@ -385,7 +358,6 @@ class DeterministicRouter:
             "agent_mode": "deterministic_fallback",
         }
 
-        # Same governance preflight as the LLM path.
         if any(p in lower for p in self.PII_VIOLATION_PHRASES):
             self.tools.db.write_audit_log(
                 session_id=self.session_id,
@@ -404,8 +376,6 @@ class DeterministicRouter:
                 governance_status="BLOCKED_BY_POLICY",
             )
             return response
-
-        import re
 
         # Activation: a supplied token determines the scope that may be activated.
         token_match = re.search(r"MKT_APPRV_[A-Za-z0-9_\-=.]+", user_prompt or "")
@@ -442,6 +412,8 @@ class DeterministicRouter:
                 approval_token=token,
                 audience_size=120,
             )
+            if res.get("status") == "SUCCESS":
+                self.state.activated_campaigns.append(res.get("activation_id", ""))
             response.update(
                 intent="campaign_activation",
                 action_taken="activate_campaign",
@@ -454,6 +426,7 @@ class DeterministicRouter:
         if "lookalike" in lower:
             seed = "Loyal Customers" if "loyal" in lower else "Champions"
             res = self.tools.generate_lookalike_audience(seed_rfm_segment=seed, top_k=25)
+            self.state.last_lookalike_id = res.get("lookalike_audience_id")
             response.update(
                 intent="lookalike_audience_generation",
                 action_taken="generate_lookalike_audience",
@@ -485,11 +458,12 @@ class DeterministicRouter:
         if any(k in lower for k in ("activate", "launch", "campaign", "plan")):
             plan = self.tools.prepare_campaign_plan(
                 campaign_name="Targeted_Reactivation_Pilot",
-                audience_id="AUD_TARGET",
+                audience_id=self.state.last_audience_id or "AUD_TARGET",
                 channel="email_marketing",
                 message_objective="Re-engage high-value accounts",
                 offer_discount="15% Off Next Renewal",
             )
+            self.state.campaign_drafts.append("Targeted_Reactivation_Pilot")
             response.update(
                 intent="campaign_planning",
                 action_taken="prepare_campaign_plan",
@@ -507,6 +481,7 @@ class DeterministicRouter:
             res = self.tools.create_audience_filter(
                 rfm_segment="At-Risk High Value", min_churn_risk=0.5
             )
+            self.state.last_audience_id = res.get("audience_id")
             response.update(
                 intent="audience_discovery",
                 action_taken="create_audience_filter",
@@ -534,7 +509,8 @@ class DeterministicRouter:
 
 if __name__ == "__main__":
     agent = MarTechSupervisorAgent()
-    print("LLM tool calling available:", agent.llm_available)
+    print("LLM multi-agent available:", agent.llm_available)
+    print("Specialists registered:", list(agent.specialists.keys()))
     out = agent.process_query("Which segments are at risk of churning?")
-    print("Mode:", out["agent_mode"])
+    print("Mode:", out["agent_mode"], "| intent:", out["intent"])
     print("Insights:", str(out["insights"])[:400])
