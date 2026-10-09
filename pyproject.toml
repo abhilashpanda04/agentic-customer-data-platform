@@ -1,0 +1,24 @@
+[project]
+name = "martech-cdp-copilot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb>=1.5.5",
+    "faker>=40.39.0",
+    "groq>=0.37.1",
+    "langchain-groq>=1.1.3",
+    "lightgbm>=4.7.0",
+    "networkx>=3.7",
+    "numpy>=2.5.3",
+    "pandas>=3.0.6",
+    "plotly>=7.1.0",
+    "pydantic>=2.13.5",
+    "pydantic-ai>=2.54.0",
+    "pytest>=9.1.1",
+    "python-dotenv>=1.2.3",
+    "scikit-learn>=1.9.1",
+    "scipy>=1.18.1",
+    "streamlit>=1.64.0",
+]

@@ -1,0 +1,48 @@
+# --- Secrets (NEVER commit) ---
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Virtual environments ---
+.venv/
+venv/
+ENV/
+
+# --- Testing / tooling caches ---
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- Data artifacts (regenerate via pipeline) ---
+data/*.duckdb
+data/*.duckdb.wal
+data/*.csv
+data/*.parquet
+!data/.gitkeep
+
+# --- Model artifacts ---
+models/
+*.pkl
+*.joblib
+*.lgb
+
+# --- OS / Editor ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
