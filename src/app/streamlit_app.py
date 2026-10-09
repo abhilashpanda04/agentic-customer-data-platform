@@ -122,7 +122,9 @@ if nav_selection == "Conversational Copilot":
             st.warning(f"⚠️ **Pending Approval Request**\nToken: `{st.session_state.pending_approval_token}`")
             col_a, col_b = st.columns(2)
             if col_a.button("✅ Approve & Activate"):
-                act_res = agent.process_query(f"Activate campaign MKT_APPRV_{st.session_state.pending_approval_token.split('_')[-1]}")
+                act_res = agent.process_query(
+                    f"Activate campaign with authorization {st.session_state.pending_approval_token}"
+                )
                 st.success(act_res.get("insights", "Campaign Activated!"))
                 st.session_state.pending_approval_token = None
             if col_b.button("❌ Reject Plan"):
